@@ -1,0 +1,370 @@
+---
+title: "Predicting Volatility: Optiver 15"
+output: html_document
+date: "2023-05-27"
+---
+
+Working Directory
+```{r setup}
+knitr::opts_knit$set(root.dir = "~/Desktop/individual_book_train")
+```
+
+Libraries
+```{r}
+library(maps)
+library(ggplot2)
+library(BiocManager)
+library(limma)
+library(Biobase)
+library(DT)
+library(tidyverse)
+library(tuneR)
+library(devtools)
+library(ggplot2)
+library(tsfeatures)
+library(stringdist)
+library(tidyr)
+library(e1071)
+library(dplyr)
+library(caTools)
+library(viridis)
+library(leaflet)
+library(crosstalk)
+library(rugarch)
+library(factoextra)
+library(shiny)
+library(zoo)
+library(readr)
+library(data.table)
+library(ggdendro)
+library(vroom)
+```
+
+Next steps:
+Start with knit
+Code to explain clustering
+Plot results
+
+Linear Regression Model
+```{r}
+#function to calculate RMSE of given stock using LR
+
+calc_rmse_linear_regression <- function(stock_1){
+  #read and mutate the stock to add new metrics
+  stock1 <- read.csv(stock_1)
+
+  stock1 <- stock1 %>% mutate(
+    WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+  stock1 <- stock1 %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+  
+  log_r1 <- list()
+  time_IDs <- unique(stock1[, 1])[1:50]
+  for (i in 1 : length(time_IDs)) {
+    sec <- stock1 %>% filter(time_id == time_IDs[i]) %>% pull(seconds_in_bucket)
+    price <- stock1 %>% filter(time_id == time_IDs[i]) %>% pull(WAP)
+    log_r <- log(price[-1] / price[1:(length(price) - 1)])
+    log_r1[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+    time.no.change <- (1:600)[!(1:600 %in% log_r1[[i]]$time)]
+    if (length(time.no.change) > 0) {
+      new.df <- data.frame(time = time.no.change, log_return = 0)
+      log_r1[[i]] <- rbind(log_r1[[i]], new.df)
+      log_r1[[i]] <- log_r1[[i]][order(log_r1[[i]]$time), ]
+    }
+  }
+  
+  vol <- list()
+  comp_vol <- function(x) {
+    return(sqrt(sum(x ^ 2)))
+  }
+  for (i in 1 : length(log_r1)) {
+    log_r1[[i]] <- log_r1[[i]] %>% mutate(time_bucket = ceiling(time / 30))
+    vol[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_vol)
+    colnames(vol[[i]]) <- c('time_bucket', 'volatility')
+  }
+  
+  #data is split into training and testing
+  vol.train <- list()
+  vol.val <- list()
+  
+  for (i in 1 : length(log_r1)) {
+    vol.train[[i]] <- vol[[i]][1:16, ]
+    vol.val[[i]] <- vol[[i]][-(1:16), ]
+  }
+  
+  list.reg <- list() 
+  stock1 <- stock1 %>% mutate(time_bucket = ceiling(seconds_in_bucket / 30),
+                              num_order = bid_size1 + ask_size1 + bid_size2 + ask_size2)
+  len.train <- length(vol.train[[1]]$volatility)
+  
+  #data is pre-processed for linear regression and then the actual linear regression is done on 50 time-ids
+  for (i in 1 : length(vol)) {
+    stats.bucket <- stock1 %>% 
+      filter(time_id == time_IDs[i] & time_bucket != 0) %>% 
+      select(c(BidAskSpread, WAP, num_order, time_bucket)) 
+    # for each 30-sec time bucket, we compute the following statistics
+    mean.price <- aggregate(WAP ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.order <- aggregate(num_order ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.BAS <- aggregate(BidAskSpread ~ time_bucket, data = stats.bucket, FUN = mean)
+    list.reg[[i]] <- data.frame(volatility = vol.train[[i]]$volatility[-1], 
+                                price = mean.price$WAP[1:(len.train - 1)],
+                                order = mean.order$num_order[1:(len.train - 1)],
+                                BidAskSpread = mean.BAS$BidAskSpread[1:(len.train - 1)])
+  }
+  
+  lm.models <- list()
+
+  for (i in 1 : length(vol)) {
+    lm.models[[i]] <- lm(volatility ~ price + order + BidAskSpread, list.reg[[i]],
+                         weights = 0.8 ^ (((len.train - 2):0) / 2))
+  }
+  
+  list.reg.val <- list()
+  len.val <- length(vol.val[[1]]$volatility)
+  pred.lm <- list()
+  
+  for (i in 1 : length(vol)) {
+    stats.bucket <- stock1 %>% 
+      filter(time_id == time_IDs[i] & time_bucket != 0) %>% 
+      select(c(BidAskSpread, WAP, num_order, time_bucket))
+    mean.price <- aggregate(WAP ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.order <- aggregate(num_order ~ time_bucket, data = stats.bucket, FUN = mean)
+    mean.BAS <- aggregate(BidAskSpread ~ time_bucket, data = stats.bucket, FUN = mean)
+    list.reg.val[[i]] <- 
+      data.frame(volatility = vol.val[[i]]$volatility, 
+                 price = mean.price$WAP[len.train:(len.train + len.val - 1)],
+                 order = mean.order$num_order[len.train:(len.train + len.val - 1)],
+                 BidAskSpread = mean.BAS$BidAskSpread[len.train:(len.train + len.val - 1)])
+    pred.lm[[i]] <- predict(lm.models[[i]], newdata = list.reg.val[[i]])
+  }
+  
+  #the predictions are compared to the training data, RMSE errors are calculated and stored as an array
+  RMSE.lm <- vector()
+
+  for (i in 1 : length(vol)) {
+    RMSE.lm <- c(RMSE.lm, sqrt(mean((vol.val[[i]]$volatility - pred.lm[[i]]) ^ 2)))
+  }
+  
+  #results are returned as an array
+  return(RMSE.lm)
+}
+```
+
+ARMA-GARCH Model
+```{r}
+#Function takes in a stock and returns an array of 50 RMSE results, one for each time ID
+calc_rmse_arma_garch <- function(stock_1){
+  stock1 <- read.csv(stock_1)
+  
+  stock1 <- stock1 %>% mutate(
+  WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+
+  stock1 <- stock1 %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+  
+  log_r1 <- list()
+  time_IDs <- unique(stock1[, 1])[1:50]
+  for (i in 1 : length(time_IDs)) {
+    sec <- stock1 %>% filter(time_id == time_IDs[i]) %>% pull(seconds_in_bucket)
+    price <- stock1 %>% filter(time_id == time_IDs[i]) %>% pull(WAP)
+    log_r <- log(price[-1] / price[1:(length(price) - 1)])
+    log_r1[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+    time.no.change <- (1:600)[!(1:600 %in% log_r1[[i]]$time)]
+    if (length(time.no.change) > 0) {
+      new.df <- data.frame(time = time.no.change, log_return = 0)
+      log_r1[[i]] <- rbind(log_r1[[i]], new.df)
+      log_r1[[i]] <- log_r1[[i]][order(log_r1[[i]]$time), ]
+    }
+  }
+  
+  vol <- list()
+  comp_vol <- function(x) {
+    return(sqrt(sum(x ^ 2)))
+  }
+  for (i in 1 : length(log_r1)) {
+    log_r1[[i]] <- log_r1[[i]] %>% mutate(time_bucket = ceiling(time / 30))
+    vol[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_vol)
+    colnames(vol[[i]]) <- c('time_bucket', 'volatility')
+  }
+  
+  spec <- ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                   mean.model = list(armaOrder = c(1, 1)), 
+                   distribution.model = "norm")
+  ARMA_GARCH.models <- list()
+    
+  for (i in 1 : length(vol)) {
+    ARMA_GARCH.models[[i]] <- ugarchfit(spec = spec, data = log_r1[[i]] %>% 
+                                          filter(time <= 480) %>% pull(log_return),
+                                        solver = 'hybrid')
+  }
+  
+  rmse_results <- rep(0, length(vol))
+  for (i in 1 : length(vol)) {
+    fspec <- getspec(ARMA_GARCH.models[[i]])
+    setfixed(fspec) <- as.list(coef(ARMA_GARCH.models[[i]]))
+    future.path <- fitted(ugarchpath(fspec, n.sim = 120, m.sim = 1))
+    # Due to numerical issues, sometimes NA value can be produced 
+    # We simply replace NA value with 0; you may come up with a better idea in your own project
+    future.path[is.na(future.path)] <- 0 
+    
+    #old code in unt7
+    
+    itest <- log_r1[[i]] %>% filter(time > 480)
+    itest <- itest[,2]
+    
+    training_logr <- list(future.path[1:30],future.path[31:60],future.path[61:90],future.path[91:120])
+    testing_logr <- list(itest[1:30],itest[31:60],itest[61:90],itest[91:120])
+  
+    training_vol <- rep(0,4)
+    testing_vol <- rep(0,4)
+  
+    for (k in 1:1){
+      training_vol[k] <- comp_vol(unlist(training_logr[k]))
+      testing_vol[k] <- comp_vol(unlist(testing_logr[k]))
+    }
+    
+    rmse_results[i] <- sqrt(mean((training_vol - testing_vol)^2))
+  }
+  
+  return(rmse_results)
+}
+```
+
+HAV-RV Model
+```{r}
+#function that inputs a stock name and calculates 50 rmse, one for each time id, using HAV-RV
+
+calc_rmse_hav_rv <- function(file_name) {
+  # Read the stock file
+  data <- read.csv(file_name)
+
+  data <- data %>% mutate(
+    WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
+  data <- data %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
+  
+  time_IDs <- unique(data$time_id)[1:50]   
+  all_results <- list()
+  #for (s in 1:length(stock_IDs)) {
+    stock_data <- data #%>% filter(stock_id == stock_IDs[s])
+    log_r1 <- list()
+    vol <- list()
+    comp_vol <- function(x) {
+      return(sqrt(sum(x ^ 2)))
+    }
+    
+    for (i in 1 : length(time_IDs)) {
+      time_data <- stock_data %>% filter(time_id == time_IDs[i])
+      sec <- time_data %>% pull(seconds_in_bucket)
+      price <- time_data %>% pull(WAP)
+ 
+      log_r <- log(price[-1] / price[1:(length(price) - 1)])
+      log_r1[[i]] <- data.frame(time = sec[-1], log_return = log_r)
+      time.no.change <- (1:600)[!(1:600 %in% log_r1[[i]]$time)]
+      if (length(time.no.change) > 0) {
+        new.df <- data.frame(time = time.no.change, log_return = 0)
+        log_r1[[i]] <- rbind(log_r1[[i]], new.df)
+        log_r1[[i]] <- log_r1[[i]][order(log_r1[[i]]$time), ]
+      }
+    }
+    
+    vol <- list()
+    comp_vol <- function(x) {
+      return(sqrt(sum(x ^ 2)))
+    }
+    for (i in 1 : length(log_r1)) {
+      log_r1[[i]] <- log_r1[[i]] %>% mutate(time_bucket = ceiling(time / 30))
+      vol[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_vol)
+      colnames(vol[[i]]) <- c('time_bucket', 'volatility')
+    }
+    
+    vol.train <- list()
+    vol.val <- list()
+    
+    for (i in 1 : length(log_r1)) {
+    n_rows <- nrow(vol[[i]])
+    split_idx <- floor(0.8 * n_rows) # Calculate the 80% index
+    vol.train[[i]] <- vol[[i]][1:split_idx, ]
+    vol.val[[i]] <- vol[[i]][-(1:split_idx), ]
+    }
+    data <- data %>% mutate(time_bucket = ceiling(seconds_in_bucket / 30),
+                                  num_order = bid_size1 + ask_size1 + bid_size2 + ask_size2)
+    len.train <- length(vol.train[[1]]$volatility)
+    
+    list.HAV <- list()
+    
+    for (i in 1 : length(vol)) {
+      mean.vol <- rep(0, len.train - 5)
+      for (j in 1 : 5) {
+        mean.vol <- mean.vol + vol.train[[i]]$volatility[j : (j + len.train - 6)] / 5
+      }
+      list.HAV[[i]] <- data.frame(vol = vol.train[[i]]$volatility[-(1:5)], 
+                                vol_1 = vol.train[[i]]$volatility[5:(len.train - 1)],
+                                mean_vol_5 = mean.vol)
+    }
+    quar <- list()
+    comp_quar <- function(x) {
+      return(length(x) / 3 * sum(x ^ 4))
+    }
+    for (i in 1 : length(log_r1)) {
+      quar[[i]] <- aggregate(log_return ~ time_bucket, data = log_r1[[i]], FUN = comp_quar)
+      colnames(quar[[i]]) <- c('time_bucket', 'quarticity')
+    }
+    
+    HAV.ols.models <- list()
+    HAV.wls.models <- list()
+    
+    for (i in 1 : length(vol)) {
+      HAV.ols.models[[i]] <- lm(vol ~ vol_1 + mean_vol_5, list.HAV[[i]])
+    
+      HAV.wls.models[[i]] <- lm(vol ~ vol_1 + mean_vol_5, list.HAV[[i]],
+                                weights = list.HAV[[i]]$vol_1 / 
+                                  sqrt(quar[[i]]$quarticity[5:(len.train - 1)]))
+    }
+    
+    list.HAV.val <- list()
+    len.val <- length(vol.val[[1]]$volatility)
+    pred.HAV.ols <- list()
+    pred.HAV.wls <- list()
+    
+    for (i in 1 : length(vol)) {
+      stats.bucket <- data %>% 
+        filter(time_id == time_IDs[i] & time_bucket != 0) %>% 
+        select(c(BidAskSpread, WAP, num_order, time_bucket))
+      mean.price <- aggregate(WAP ~ time_bucket, data = stats.bucket, FUN = mean)
+      mean.order <- aggregate(num_order ~ time_bucket, data = stats.bucket, FUN = mean)
+      mean.BAS <- aggregate(BidAskSpread ~ time_bucket, data = stats.bucket, FUN = mean)
+    
+      vol_1 <- vol[[i]]$volatility[1:(len.train + len.val - 1)]
+      mean_vol_5 <- rollapply(vol[[i]]$volatility, 5, FUN = mean, align = "right", fill = NA)[1:(len.train + len.val - 1)]
+    
+      list.HAV.val[[i]] <- 
+        data.frame(volatility = vol.val[[i]]$volatility, 
+                   price = mean.price$WAP[len.train:(len.train + len.val - 1)],
+                   order = mean.order$num_order[len.train:(len.train + len.val - 1)],
+                   BidAskSpread = mean.BAS$BidAskSpread[len.train:(len.train + len.val - 1)],
+                   vol_1 = vol_1[len.train:(len.train + len.val - 1)],
+                   mean_vol_5 = mean_vol_5[len.train:(len.train + len.val - 1)])
+      #pred.HAV.ols[[i]] <- predict(HAV.ols.models[[i]], newdata = list.HAV.val[[i]])
+      pred.HAV.wls[[i]] <- predict(HAV.wls.models[[i]], newdata = list.HAV.val[[i]])
+    }
+
+  RMSE.hav <- vector()
+
+  for (i in 1 : length(vol)) {
+    RMSE.hav <- c(RMSE.hav, sqrt(mean((vol.val[[i]]$volatility - pred.HAV.wls[[i]]) ^ 2)))
+  }
+  
+  #results are returned as an array
+  return(RMSE.hav)
+}
+```
+
+```{r}
+results <- calc_rmse_hav_rv("stock_1.csv")
+```
+
+```{r}
+arma_garch <- calc_rmse_arma_garch("stock_1.csv")
+```
+
+```{r}
+lr <- calc_rmse_linear_regression("stock_1.csv")
+```
