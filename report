@@ -40,11 +40,6 @@ library(ggdendro)
 library(vroom)
 ```
 
-Next steps:
-Start with knit
-Code to explain clustering
-Plot results
-
 Linear Regression Model
 ```{r}
 #function to calculate RMSE of given stock using LR
@@ -157,7 +152,7 @@ calc_rmse_arma_garch <- function(stock_1){
   
   stock1 <- stock1 %>% mutate(
   WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1))
-
+  
   stock1 <- stock1 %>% mutate(BidAskSpread = ask_price1 / bid_price1 - 1)
   
   log_r1 <- list()
@@ -215,10 +210,12 @@ calc_rmse_arma_garch <- function(stock_1){
   
     training_vol <- rep(0,4)
     testing_vol <- rep(0,4)
+    vol_vol <- rep(0,4)
   
-    for (k in 1:1){
+    for (k in 1:4){
       training_vol[k] <- comp_vol(unlist(training_logr[k]))
       testing_vol[k] <- comp_vol(unlist(testing_logr[k]))
+      vol_vol[k] <- vol[[i]]$volatility[16+k]
     }
     
     rmse_results[i] <- sqrt(mean((training_vol - testing_vol)^2))
@@ -357,14 +354,43 @@ calc_rmse_hav_rv <- function(file_name) {
 }
 ```
 
+Generating results
 ```{r}
-results <- calc_rmse_hav_rv("stock_1.csv")
+#reads in a table that shows what stocks are in each cluster
+clusters_df <- read_csv("clusters_data.csv")
+
+#sets up a dataframe for final results, showing the model used and cluster for each calculated rmse value
+all_results_df <- data.frame()
+
+for (cn in 1:4){
+  #gets the id of each stock in a cluster
+  stock_ids <- clusters_df |> filter(cluster == cn) |> pull(stock_id)
+  
+  #runs each model on each stock in the cluster, appends the results to the all_results_df dataframe
+  for (stock in stock_ids){
+    #gets stock name
+    stock <- paste("stock_",stock,".csv",sep="")
+    
+    #runs models
+    lr_res <- data.frame(rmse = calc_rmse_linear_regression(stock), group = "Linear Regression", cluster = cn)
+    ag_res <- data.frame(rmse = calc_rmse_arma_garch(stock), group = "HAV-RV", cluster = cn)
+    hav_res <- data.frame(rmse = calc_rmse_hav_rv(stock), group = "ARMA-GARCH", cluster = cn)
+    
+    all_results_df <- rbind(all_results_df,lr_res, ag_res, hav_res)
+    
+    #checks progress
+    print(stock)
+  }
+}
 ```
 
+Plotting results
 ```{r}
-arma_garch <- calc_rmse_arma_garch("stock_1.csv")
-```
-
-```{r}
-lr <- calc_rmse_linear_regression("stock_1.csv")
+ggplot(all_results_df, aes(x=cluster, y=rmse, fill=group)) + 
+    geom_boxplot() +
+    facet_wrap(~cluster, scale="free") +
+    ylim(0,0.0015) + 
+    xlab("Cluster") + 
+    ylab("RMSE Value") + 
+    ggtitle("Model Accuracy")
 ```
